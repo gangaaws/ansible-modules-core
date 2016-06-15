@@ -46,9 +46,9 @@ facts:
             "ports": "48","status": "active *"}],"os": "6.1(2)I3(1)",
             "platform": "Nexus9000 C9396PX Chassis","power_supply_info": [{
             "actual_output": "0 W","model": "N9K-PAC-650W","number": "1",
-            "status":"Shutdown"}],"rr":"Reset Requested by CLI command reload",
-            "vlan_list":[{"admin_state":"noshutdown","interfaces":["Ethernet1/1"],
-            "name": "default","state": "active","vlan_id": "1"}]}
+            "status":"Shutdown"}], "vlan_list":[{"admin_state":"noshutdown",
+            "interfaces":["Ethernet1/1"], "name": "default",
+            "state": "active","vlan_id": "1"}]}
 '''
 
 
@@ -104,11 +104,9 @@ def get_show_version_facts(module):
     body = execute_show_command(command, module)[0]
 
     key_map = {
-                "rr_sys_ver": "os",
-                "kickstart_ver_str": "kickstart",
+                "kickstart_ver_str": "os",
                 "chassis_id": "platform",
-                "host_name": "hostname",
-                "rr_reason": "rr"
+                "host_name": "hostname"
             }
 
     mapped_show_version_facts = apply_key_map(key_map, body)
