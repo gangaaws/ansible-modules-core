@@ -35,8 +35,14 @@ options:
     interface:
         description:
             - Full name of interface, i.e. Ethernet1/1, port-channel10.
-        required: true
+        required: false
         default: null
+    interface_type:
+        description:
+            - Interface type to be unconfigured from the device.
+        required: false
+        default: null
+        choices: ['loopback', 'portchannel', 'svi']
     admin_state:
         description:
             - Administrative state of the interface
@@ -70,10 +76,10 @@ EXAMPLES = '''
 - nxos_interface: interface=Ethernet2/1 host={{ inventory_hostname }} admin_state=down
 
 # Remove all loopback interfaces
-- nxos_interface: interface=loopback state=absent host={{ inventory_hostname }}
+- nxos_interface: interface_type=loopback state=absent host={{ inventory_hostname }}
 
 # Remove all logical interfaces
-- nxos_interface: interface={{ item }} state=absent host={{ inventory_hostname }}
+- nxos_interface: interface_type={{ item }} state=absent host={{ inventory_hostname }}
   with_items:
     - loopback
     - portchannel
@@ -595,90 +601,106 @@ def flatten_list(command_lists):
     return flat_command_list
 
 
+def get_interface_type_removed_cmds(interfaces):
+    commands = []
+
+    for interface in interfaces:
+        commands.append('no interface {0}'.format(interface))
+
+    return commands
+
+
 def main():
 
     argument_spec = dict(
-        interface=dict(required=True,),
+        interface=dict(required=False),
         admin_state=dict(default='up', choices=['up', 'down'], required=False),
         description=dict(required=False, default=None),
         mode=dict(choices=['layer2', 'layer3'], required=False),
+        interface_type=dict(required=False,
+                            choices=['loopback', 'portchannel', 'svi']),
         state=dict(choices=['absent', 'present', 'default'],
                    default='present', required=False)
     )
     module = get_module(argument_spec=argument_spec,
+                        mutually_exclusive=[['interface', 'interface_type']],
                         supports_check_mode=True)
 
-    interface = module.params['interface'].lower()
+    interface = module.params['interface']
+    interface_type = module.params['interface_type']
     admin_state = module.params['admin_state']
     description = module.params['description']
     mode = module.params['mode']
     state = module.params['state']
 
-    changed = False
+    if interface:
+        interface = interface.lower()
+        intf_type = get_interface_type(interface)
+        normalized_interface = normalize_interface(interface)
 
-    args = dict(interface=interface, admin_state=admin_state,
-                description=description, mode=mode)
+        if normalized_interface == 'Vlan1' and state == 'absent':
+            module.fail_json(msg='ERROR: CANNOT REMOVE VLAN 1!')
 
-    intf_type = get_interface_type(interface)
+        args = dict(interface=interface, admin_state=admin_state,
+                    description=description, mode=mode)
 
-    normalized_interface = normalize_interface(interface)
-
-    if normalized_interface == 'Vlan1' and state == 'absent':
-        module.fail_json(msg='ERROR: CANNOT REMOVE VLAN 1!')
-
-    if intf_type == 'svi':
-        feature = 'interface-vlan'
-        available_features = get_available_features(feature, module)
-        svi_state = available_features[feature]
-        if svi_state == 'disabled':
+        if intf_type == 'unknown':
             module.fail_json(
-                msg='SVI (interface-vlan) feature needs to be enabled first',
-            )
+                msg='unknown interface type found-1',
+                interface=interface)
 
-    if intf_type == 'unknown':
-        module.fail_json(
-            msg='unknown interface type found-1',
-            interface=interface)
+        existing, is_default = smart_existing(module, intf_type, normalized_interface)
+        proposed = get_proposed(existing, normalized_interface, args)
+    else:
+        intf_type = normalized_interface = interface_type
+        proposed = dict(interface_type=interface_type)
 
-    existing, is_default = smart_existing(module, intf_type, normalized_interface)
-    proposed = get_proposed(existing, normalized_interface, args)
-
-    delta = dict()
+    changed = False
     commands = []
 
-    if state == 'absent':
-        if intf_type in ['svi', 'loopback', 'portchannel']:
-            if is_default != 'DNE':
-                cmds = ['no interface {0}'.format(normalized_interface)]
-                commands.append(cmds)
-        elif intf_type in ['ethernet']:
-            if is_default is False:
-                cmds = ['default interface {0}'.format(normalized_interface)]
-                commands.append(cmds)
-    elif state == 'present':
-        if not existing:
-            cmds = get_interface_config_commands(proposed,
-                                                 normalized_interface,
-                                                 existing)
-            commands.append(cmds)
-        else:
-            delta = dict(set(proposed.iteritems()).difference(
-                existing.iteritems()))
-            if delta:
-                cmds = get_interface_config_commands(delta,
+    if interface:
+        delta = dict()
+
+        if state == 'absent':
+            if intf_type in ['svi', 'loopback', 'portchannel']:
+                if is_default != 'DNE':
+                    cmds = ['no interface {0}'.format(normalized_interface)]
+                    commands.append(cmds)
+            elif intf_type in ['ethernet']:
+                if is_default is False:
+                    cmds = ['default interface {0}'.format(normalized_interface)]
+                    commands.append(cmds)
+        elif state == 'present':
+            if not existing:
+                cmds = get_interface_config_commands(proposed,
                                                      normalized_interface,
                                                      existing)
                 commands.append(cmds)
-    elif state == 'default':
-        if is_default is False:
-            cmds = ['default interface {0}'.format(normalized_interface)]
-            commands.append(cmds)
-        elif is_default == 'DNE':
-            module.exit_json(msg='interface you are trying to default does'
-                             ' not exist')
+            else:
+                delta = dict(set(proposed.iteritems()).difference(
+                    existing.iteritems()))
+                if delta:
+                    cmds = get_interface_config_commands(delta,
+                                                         normalized_interface,
+                                                         existing)
+                    commands.append(cmds)
+        elif state == 'default':
+            if is_default is False:
+                cmds = ['default interface {0}'.format(normalized_interface)]
+                commands.append(cmds)
+            elif is_default == 'DNE':
+                module.exit_json(msg='interface you are trying to default does'
+                                 ' not exist')
+    elif interface_type:
+        if state == 'present':
+            module.fail_json(msg='The interface_type param can be used '
+                                 'only with state absent.')
+
+        existing = get_interfaces_dict(module)[interface_type]
+        cmds = get_interface_type_removed_cmds(existing)
+        commands.append(cmds)
 
     cmds = flatten_list(commands)
-
     end_state = existing
 
     if cmds:
@@ -686,19 +708,22 @@ def main():
             module.exit_json(changed=True, commands=cmds)
         else:
             execute_config_command(cmds, module)
-            if delta.get('mode'): # or delta.get('admin_state'):
-                # if the mode changes from L2 to L3, the admin state
-                # seems to change after the API call, so adding a second API
-                # call to ensure it's in the desired state.
-                admin_state = delta.get('admin_state') or admin_state
-                c1 = 'interface {0}'.format(normalized_interface)
-                c2 = get_admin_state(delta, normalized_interface, admin_state)
-                cmds2 = [c1, c2]
-                execute_config_command(cmds2, module)
-                cmds.extend(cmds2)
             changed = True
-            end_state, is_default = smart_existing(module, intf_type,
-                                                   normalized_interface)
+            if module.params['interface']:
+                if delta.get('mode'): # or delta.get('admin_state'):
+                    # if the mode changes from L2 to L3, the admin state
+                    # seems to change after the API call, so adding a second API
+                    # call to ensure it's in the desired state.
+                    admin_state = delta.get('admin_state') or admin_state
+                    c1 = 'interface {0}'.format(normalized_interface)
+                    c2 = get_admin_state(delta, normalized_interface, admin_state)
+                    cmds2 = [c1, c2]
+                    execute_config_command(cmds2, module)
+                    cmds.extend(cmds2)
+                end_state, is_default = smart_existing(module, intf_type,
+                                                       normalized_interface)
+            else:
+                end_state = get_interfaces_dict(module)[interface_type]
 
     results = {}
     results['proposed'] = proposed
