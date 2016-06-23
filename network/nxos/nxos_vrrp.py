@@ -57,6 +57,12 @@ options:
             - clear text authentication string
         required: false
         default: null
+    admin_state:
+        description:
+            - Used to enable or disable the VRRP process
+        required: false
+        choices: ['shutdown', 'no shutdown']
+        default: no shutdown
     state:
         description:
             - Specify desired state of the resource
@@ -83,7 +89,8 @@ proposed:
     description: k/v pairs of parameters passed into module
     returned: always
     type: dict
-    sample: {"authentication": "testing", "group": "150", "vip": "10.1.15.1"}
+    sample: {"authentication": "testing", "group": "150", "vip": "10.1.15.1",
+            "admin_state": "no shutdown"}
 existing:
     description: k/v pairs of existing vrrp info on the interface
     type: dict
@@ -93,7 +100,8 @@ end_state:
     returned: always
     type: dict
     sample: {"authentication": "testing", "group": "150", "interval": "1",
-            "preempt": true, "priority": "100", "vip": "10.1.15.1"}
+            "preempt": true, "priority": "100", "vip": "10.1.15.1",
+            "admin_state": "no shutdown"}
 state:
     description: state as sent in from the playbook
     returned: always
@@ -104,7 +112,7 @@ updates:
     returned: always
     type: list
     sample: ["interface vlan10", "vrrp 150", "address 10.1.15.1",
-            "authentication text testing"]
+            "authentication text testing", "no shutdown"]
 changed:
     description: check to see if a change was made on the device
     returned: always
@@ -116,8 +124,7 @@ changed:
 def execute_config_command(commands, module):
     try:
         module.configure(commands)
-    except ShellError:
-        clie = get_exception()
+    except ShellError, clie:
         module.fail_json(msg='Error sending CLI commands',
                          error=str(clie), commands=commands)
 
@@ -150,8 +157,7 @@ def execute_show(cmds, module, command_type=None):
             response = module.execute(cmds, command_type=command_type)
         else:
             response = module.execute(cmds)
-    except ShellError:
-        clie = get_exception()
+    except ShellError, clie:
         module.fail_json(msg='Error sending {0}'.format(command),
                          error=str(clie))
     return response
@@ -221,19 +227,43 @@ def get_interface_mode(interface, intf_type, module):
     command = 'show interface {0}'.format(interface)
     interface = {}
     mode = 'unknown'
+    body = execute_show_command(command, module)[0]
+    interface_table = body['TABLE_interface']['ROW_interface']
+    name = interface_table.get('interface')
 
     if intf_type in ['ethernet', 'portchannel']:
-        body = execute_show_command(command, module)[0]
-        interface_table = body['TABLE_interface']['ROW_interface']
         mode = str(interface_table.get('eth_mode', 'layer3'))
+
         if mode == 'access' or mode == 'trunk':
             mode = 'layer2'
     elif intf_type == 'svi':
         mode = 'layer3'
-    return mode
+
+    return mode, name
 
 
-def get_existing_vrrp(interface, group, module):
+def get_vrr_status(group, module, interface):
+    command = 'show run all | section interface.{0}$'.format(interface)
+    body = execute_show_command(command, module, command_type='cli_show_ascii')[0]
+    vrf_index = None
+    admin_state = 'shutdown'
+
+    if body:
+        splitted_body = body.splitlines()
+        for index in range(0, len(splitted_body) - 1):
+            if splitted_body[index].strip() == 'vrrp {0}'.format(group):
+                vrf_index = index
+        vrf_section = splitted_body[vrf_index::]
+
+        for line in vrf_section:
+            if line.strip() == 'no shutdown':
+                admin_state = 'no shutdown'
+                break
+
+    return admin_state
+
+
+def get_existing_vrrp(interface, group, module, name):
     command = 'show vrrp detail interface {0}'.format(interface)
     body = execute_show_command(command, module)
     vrrp = {}
@@ -265,6 +295,8 @@ def get_existing_vrrp(interface, group, module):
             parsed_vrrp['preempt'] = True
 
         if parsed_vrrp['group'] == group:
+            parsed_vrrp['admin_state'] = get_vrr_status(group, module, name)
+
             return parsed_vrrp
     return vrrp
 
@@ -285,6 +317,7 @@ def get_commands_config_vrrp(delta, group):
     preempt = delta.get('preempt')
     interval = delta.get('interval')
     auth = delta.get('authentication')
+    admin_state = delta.get('admin_state')
 
     if vip:
         commands.append((CMDS.get('vip')).format(vip))
@@ -298,6 +331,8 @@ def get_commands_config_vrrp(delta, group):
         commands.append((CMDS.get('interval')).format(interval))
     if auth:
         commands.append((CMDS.get('auth')).format(auth))
+    if admin_state:
+        commands.append(admin_state)
 
     commands.insert(0, 'vrrp {0}'.format(group))
 
@@ -340,6 +375,9 @@ def main():
             priority=dict(required=False, type='str'),
             preempt=dict(required=False, choices=BOOLEANS, type='bool'),
             vip=dict(required=False, type='str'),
+            admin_state=dict(required=False, type='str',
+                                choices=['shutdown', 'no shutdown'],
+                                default='no shutdown'),
             authentication=dict(required=False, type='str'),
             state=dict(choices=['absent', 'present'],
                        required=False, default='present'),
@@ -354,6 +392,7 @@ def main():
     preempt = module.params['preempt']
     vip = module.params['vip']
     authentication = module.params['authentication']
+    admin_state = module.params['admin_state']
 
     transport = module.params['transport']
 
@@ -369,16 +408,17 @@ def main():
             module.fail_json(msg="Loopback interfaces don't support VRRP.",
                              interface=interface)
 
-    mode = get_interface_mode(interface, intf_type, module)
+    mode, name = get_interface_mode(interface, intf_type, module)
     if mode == 'layer2':
         module.fail_json(msg='That interface is a layer2 port.\nMake it '
                              'a layer 3 port first.', interface=interface)
 
     args = dict(group=group, priority=priority, preempt=preempt,
-                vip=vip, authentication=authentication)
+                vip=vip, authentication=authentication,
+                admin_state=admin_state)
 
     proposed = dict((k, v) for k, v in args.iteritems() if v is not None)
-    existing = get_existing_vrrp(interface, group, module)
+    existing = get_existing_vrrp(interface, group, module, name)
 
     changed = False
     end_state = existing
@@ -405,7 +445,7 @@ def main():
         else:
             execute_config_command(cmds, module)
             changed = True
-            end_state = get_existing_vrrp(interface, group, module)
+            end_state = get_existing_vrrp(interface, group, module, name)
 
     results = {}
     results['proposed'] = proposed
